@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>파동 중첩 시뮬레이터</title>
+<style>
+  :root{--bg:#f8fafc;--panel:#fff;--accent:#0ea5e9;--muted:#64748b}
+  html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Noto Sans KR',sans-serif;background:var(--bg);color:#0f172a}
+  .wrap{display:flex;gap:18px;padding:18px;align-items:flex-start}
+  .left{flex:1}
+  .panel{width:360px;background:var(--panel);border-radius:10px;padding:14px;box-shadow:0 8px 32px rgba(2,6,23,0.08)}
+  header h1{margin:0 0 12px 0;font-size:18px}
+  canvas{width:100%;height:auto;border-radius:8px;background:#000}
+  .controls{display:grid;gap:8px}
+  label{font-size:13px;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+  .row{display:flex;gap:8px;align-items:center}
+  input[type=range]{width:100%}
+  select,input[type=number]{padding:6px;border-radius:6px;border:1px solid #e6edf3}
+  button{background:var(--accent);color:white;border:none;padding:8px 10px;border-radius:8px;cursor:pointer}
+  .small{font-size:12px;color:var(--muted)}
+  .sources{display:flex;gap:8px;flex-wrap:wrap}
+  .legend{display:flex;gap:8px;align-items:center;margin-top:8px}
+  .chip{padding:6px 8px;border-radius:999px;background:#eef2ff;font-size:12px}
+  footer{margin-top:10px;font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="left">
+    <div style="background:#fff;border-radius:10px;padding:12px;box-shadow:0 8px 24px rgba(2,6,23,0.06)">
+      <canvas id="canvas" width="900" height="600" aria-label="파동 중첩 시뮬레이션"></canvas>
+    </div>
+    <div class="legend">
+      <div class="chip">두 점원에서 방사되는 원형 파동(동일 주파수·동상)</div>
+      <div class="chip">파동은 2D(원통파)로 감쇠 선택 가능</div>
+    </div>
+    <footer class="small">설명: 시간평균 세기로 표시하면 전형적 간섭무늬(밝은/어두운 줄)를 안정적으로 볼 수 있습니다.</footer>
+  </section>
+
+  <aside class="panel">
+    <header><h1>파동 중첩 설정</h1></header>
+    <div class="controls">
+      <div>
+        <label>파장 λ (픽셀) <strong id="lambdaVal">60</strong></label>
+        <input id="lambda" type="range" min="10" max="300" step="1" value="60">
+      </div>
+
+      <div>
+        <label>파동 속도 c (px/s) <strong id="speedVal">120</strong></label>
+        <input id="speed" type="range" min="20" max="400" step="1" value="120">
+      </div>
+
+      <div>
+        <label>감쇠 (진폭 거리의존)</label>
+        <select id="decay">
+          <option value="none">없음 (균일 진폭)</option>
+          <option value="inv_rsqrt" selected>1/√r (원통파 근사)</option>
+          <option value="inv_r">1/r (강한 감쇠)</option>
+        </select>
+      </div>
+
+      <div>
+        <label>표시 모드</label>
+        <select id="mode">
+          <option value="avg">시간-평균 세기 (권장)</option>
+          <option value="inst">순간 진폭^2 (애니메이션)</option>
+        </select>
+      </div>
+
+      <div>
+        <label>샘플 해상도 (픽셀 간격) <span class="small">(속도↔정확도)</span></label>
+        <input id="step" type="range" min="1" max="6" step="1" value="3">
+      </div>
+
+      <div style="display:flex;gap:8px">
+        <button id="play">▶ 재생</button>
+        <button id="pause">■ 정지</button>
+        <button id="reset">↺ 초기화</button>
+      </div>
+
+      <hr>
+      <div>
+        <label>원점(소스) 위치 조절: 캔버스에서 드래그</label>
+        <div class="sources small">원1(빨간 점), 원2(파란 점)</div>
+      </div>
+
+      <div>
+        <label>정규화 방식</label>
+        <select id="norm">
+          <option value="local">현재 뷰에서 자동 정규화</option>
+          <option value="global">글로벌(절대값 기준)</option>
+        </select>
+      </div>
+
+      <div class="small">참고: 이 모델은 두 개의 <strong>동일 주파수·결맞음(coherent)</strong> 점원(point sources)을 가정합니다. 슬릿/회절 등 고급 현상은 별도 모델 필요.</div>
+    </div>
+  </aside>
+</div>
+
+<script>
+// ------------------------- 유틸 -------------------------
+const $ = id => document.getElementById(id);
+const canvas = $('canvas');
+const ctx = canvas.getContext('2d');
+let W = canvas.width, H = canvas.height;
+
+function toRad(d){ return d * Math.PI / 180; }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+// ------------------------- 상태 -------------------------
+const state = {
+  lambda: 60, // pixels
+  c: 120, // px/s
+  decay: 'inv_rsqrt',
+  mode: 'avg',
+  step: 3,
+  playing: false,
+  t: 0, // seconds
+  normMode: 'local'
+};
+
+// 소스 위치(초기)
+let sources = [ {x: W*0.35, y: H*0.5}, {x: W*0.65, y: H*0.5} ];
+let draggingIndex = -1;
+
+// ------------------------- DOM 바인딩 -------------------------
+$('lambda').addEventListener('input', e=>{ state.lambda = +e.target.value; $('lambdaVal').textContent = state.lambda; render(); });
+$('speed').addEventListener('input', e=>{ state.c = +e.target.value; $('speedVal').textContent = state.c; render(); });
+$('decay').addEventListener('change', e=>{ state.decay = e.target.value; render(); });
+$('mode').addEventListener('change', e=>{ state.mode = e.target.value; render(); });
+$('step').addEventListener('input', e=>{ state.step = +e.target.value; render(); });
+$('play').addEventListener('click', ()=>{ start(); });
+$('pause').addEventListener('click', ()=>{ stop(); });
+$('reset').addEventListener('click', ()=>{ reset(); });
+$('norm').addEventListener('change', e=>{ state.normMode = e.target.value; render(); });
+
+// 캔버스 리사이즈 (픽셀비율 고려)
+function resize(){
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.round(rect.width * dpr);
+  canvas.height = Math.round(rect.height * dpr);
+  W = canvas.width; H = canvas.height;
+  // scale back sources to new pixel ratio roughly
+  render();
+}
+window.addEventListener('resize', resize);
+setTimeout(resize, 0);
+
+// ------------------------- 물리/시뮬레이션 함수 -------------------------
+function amplitudeDecay(r){
+  // r in pixels, avoid singularity
+  r = Math.max(r, 1);
+  if(state.decay === 'none') return 1.0;
+  if(state.decay === 'inv_r') return 1.0 / r;
+  // default: 1/sqrt(r) for cylindrical waves
+  return 1.0 / Math.sqrt(r);
+}
+
+function computeTimeAveragedIntensity(x,y){
+  // analytic time-average for two harmonic sources of same omega
+  const lambda = state.lambda;
+  const k = 2*Math.PI / lambda;
+  const src0 = sources[0], src1 = sources[1];
+  const dx0 = x - src0.x, dy0 = y - src0.y; const r0 = Math.hypot(dx0,dy0);
+  const dx1 = x - src1.x, dy1 = y - src1.y; const r1 = Math.hypot(dx1,dy1);
+  const a0 = amplitudeDecay(r0);
+  const a1 = amplitudeDecay(r1);
+  // I = 1/2(a0^2 + a1^2) + a0*a1*cos(k*(r0 - r1))
+  const I = 0.5*(a0*a0 + a1*a1) + a0*a1*Math.cos(k*(r0 - r1));
+  return I;
+}
+
+function computeInstantIntensity(x,y,t){
+  // instantaneous field squared: (a0 cos(wt - kr0) + a1 cos(wt - kr1))^2
+  const lambda = state.lambda;
+  const k = 2*Math.PI / lambda;
+  const omega = 2*Math.PI * (state.c / lambda); // ω = 2π f, f = c/λ
+  const src0 = sources[0], src1 = sources[1];
+  const r0 = Math.hypot(x - src0.x, y - src0.y);
+  const r1 = Math.hypot(x - src1.x, y - src1.y);
+  const a0 = amplitudeDecay(r0);
+  const a1 = amplitudeDecay(r1);
+  const phi0 = omega * t - k * r0;
+  const phi1 = omega * t - k * r1;
+  const s = a0 * Math.cos(phi0) + a1 * Math.cos(phi1);
+  return s*s;
+}
+
+// ------------------------- 렌더링 -------------------------
+function render(){
+  if(!ctx) return;
+  const step = state.step;
+  const mode = state.mode;
+  ctx.clearRect(0,0,W,H);
+
+  // compute intensity map (sampled)
+  const cols = Math.ceil(W / step);
+  const rows = Math.ceil(H / step);
+  let intensities = new Float32Array(cols * rows);
+  let minI = Infinity, maxI = -Infinity;
+  const t = state.t;
+
+  for(let j=0;j<rows;j++){
+    const y = (j+0.5)*step;
+    for(let i=0;i<cols;i++){
+      const x = (i+0.5)*step;
+      const I = (mode === 'avg') ? computeTimeAveragedIntensity(x,y) : computeInstantIntensity(x,y,t);
+      const idx = j*cols + i;
+      intensities[idx] = I;
+      if(I < minI) minI = I;
+      if(I > maxI) maxI = I;
+    }
+  }
+
+  // normalization
+  if(minI === maxI) { minI = 0; maxI = minI + 1; }
+  // optionally global normalization could be implemented
+
+  for(let j=0;j<rows;j++){
+    for(let i=0;i<cols;i++){
+      const idx = j*cols + i;
+      let v = intensities[idx];
+      // normalize to 0..1
+      v = (v - minI) / (maxI - minI);
+      // map to color (simple heatmap)
+      const hue = (1 - v) * 240; // blue(240) .. red(0)
+      const light = 30 + v*50; // L in HSL
+      ctx.fillStyle = `hsl(${hue} 100% ${light}%)`;
+      ctx.fillRect(i*step, j*step, step, step);
+    }
+  }
+
+  // draw sources
+  for(let s=0;s<sources.length;s++){
+    const src = sources[s];
+    ctx.beginPath();
+    ctx.arc(src.x, src.y, 6, 0, Math.PI*2);
+    ctx.fillStyle = s===0 ? '#ff3b30' : '#3b82f6';
+    ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+  }
+
+  // overlay: text
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = '14px Arial';
+  ctx.fillText(`λ=${state.lambda}px  c=${state.c}px/s  mode=${state.mode}` , 10, 20);
+}
+
+// ------------------------- 애니메이션 제어 -------------------------
+let raf = null;
+function frame(ts){
+  // ts in ms
+  state.t = (state.t || 0) + (ts - (frame._lastTs || ts))/1000;
+  frame._lastTs = ts;
+  render();
+  if(state.playing) raf = requestAnimationFrame(frame);
+}
+
+function start(){ if(!state.playing){ state.playing = true; frame._lastTs = null; raf = requestAnimationFrame(frame);} }
+function stop(){ state.playing = false; if(raf) cancelAnimationFrame(raf); raf = null; }
+function reset(){ stop(); state.t = 0; render(); }
+
+// ------------------------- 소스 드래그 -------------------------
+canvas.addEventListener('mousedown', (e)=>{
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width/rect.width);
+  const y = (e.clientY - rect.top) * (canvas.height/rect.height);
+  for(let i=0;i<sources.length;i++){
+    const s = sources[i];
+    const d = Math.hypot(x - s.x, y - s.y);
+    if(d < 12){ draggingIndex = i; break; }
+  }
+});
+window.addEventListener('mousemove', (e)=>{
+  if(draggingIndex === -1) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width/rect.width);
+  const y = (e.clientY - rect.top) * (canvas.height/rect.height);
+  sources[draggingIndex].x = clamp(x, 0, canvas.width);
+  sources[draggingIndex].y = clamp(y, 0, canvas.height);
+  render();
+});
+window.addEventListener('mouseup', ()=>{ draggingIndex = -1; });
+
+// 초기 렌더
+render();
+</script>
+</body>
+</html>
